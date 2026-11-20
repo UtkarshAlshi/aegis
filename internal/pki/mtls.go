@@ -55,10 +55,12 @@ func (m *Clients) Authenticate(r *http.Request) (session.Identity, error) {
 
 func (m *Clients) identity(cs tls.ConnectionState) (session.Identity, error) {
 	var id session.Identity
-	if len(cs.PeerCertificates) != 1 || len(cs.VerifiedChains) == 0 {
+	// TLS clients may send the trust anchor along with a directly issued leaf.
+	chain := cs.PeerCertificates
+	if len(chain) == 0 || len(chain) > 2 || (len(chain) == 2 && !chain[1].Equal(m.ca)) || len(cs.VerifiedChains) == 0 {
 		return id, errors.New("direct verified client certificate required")
 	}
-	leaf := cs.PeerCertificates[0]
+	leaf := chain[0]
 	now := m.clock.Now()
 	if leaf.CheckSignatureFrom(m.ca) != nil || leaf.IsCA || leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 ||
 		!slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageClientAuth) ||

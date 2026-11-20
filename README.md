@@ -82,7 +82,7 @@ go run ./cmd/aegis-pki issue client -dir ./local-pki -name robot -out robot
 go run ./cmd/aegis-pki revoke -dir ./local-pki -cert ./local-pki/robot.crt
 ```
 
-The gateway reads the CA certificate and revocation file only. Keep the CA private key on the issuing host. Supply only the issued leaf in the machine client's certificate file.
+The gateway reads the CA certificate and revocation file only. Keep the CA private key on the issuing host. Supply the issued leaf in the machine client's certificate file. Clients may also send the configured root.
 
 ## Security properties
 

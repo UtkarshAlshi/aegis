@@ -112,8 +112,23 @@ func TestMTLSHandshakeAndRevocation(t *testing.T) {
 			}
 		})
 	}
+	presentedRoot, err := ParseCertificate(root.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withRoot := robot
+	withRoot.Certificate = append(append([][]byte(nil), robot.Certificate...), presentedRoot.Raw)
+	res, err := getClient(withRoot, "").Get(srv.URL)
+	if err != nil {
+		t.Fatalf("TLS client sending the configured root: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatal("client chain with the configured root was denied")
+	}
+
 	live := getClient(robot, "")
-	res, err := live.Get(srv.URL)
+	res, err = live.Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
