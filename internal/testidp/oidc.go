@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,10 @@ type OIDC struct {
 var login = template.Must(template.New("login").Parse(`<!doctype html><html lang="en"><meta charset="utf-8"><title>Demo OIDC</title><h1>Demo OIDC</h1><form method="post"><button>Continue as alice (engineering)</button></form></html>`))
 
 func NewOIDC(c clock.Clock, clientID, redirect string) (*OIDC, error) {
+	return NewOIDCTLS(c, clientID, redirect, nil)
+}
+
+func NewOIDCTLS(c clock.Clock, clientID, redirect string, transport *tls.Config) (*OIDC, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -67,7 +72,9 @@ func NewOIDC(c clock.Clock, clientID, redirect string) (*OIDC, error) {
 	mux.HandleFunc("GET /keys", p.keys)
 	mux.HandleFunc("/authorize", p.authorize)
 	mux.HandleFunc("POST /token", p.token)
-	p.Server = httptest.NewTLSServer(mux)
+	p.Server = httptest.NewUnstartedServer(mux)
+	p.Server.TLS = transport
+	p.Server.StartTLS()
 	return p, nil
 }
 

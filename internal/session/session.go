@@ -183,3 +183,12 @@ func (p *Pending[T]) Take(r *http.Request, name, key string) (T, bool) {
 	}
 	return value.value, true
 }
+
+// CurrentID captures a browser's existing session at the start of a SAML flow.
+func CurrentID(r *http.Request) string { return token(r, Cookie) }
+
+func (s *Store) Revoke(id string) {
+	s.mu.Lock()
+	delete(s.sessions, id)
+	s.mu.Unlock()
+}

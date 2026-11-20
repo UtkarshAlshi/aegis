@@ -13,6 +13,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type SAML struct {
+	EntityID string `yaml:"entity_id"`
+	Metadata string `yaml:"metadata"`
+}
+
+type MTLS struct {
+	Listen      string `yaml:"listen"`
+	CA          string `yaml:"ca"`
+	Revocations string `yaml:"revocations"`
+}
+
 type Config struct {
 	Listen         string         `yaml:"listen"`
 	PublicURL      string         `yaml:"public_url"`
@@ -24,6 +35,8 @@ type Config struct {
 	Policy         string         `yaml:"policy"`
 	TrustedProxies []netip.Prefix `yaml:"trusted_proxies"`
 	OIDC           *oidc.Config   `yaml:"oidc"`
+	SAML           *SAML          `yaml:"saml"`
+	MTLS           *MTLS          `yaml:"mtls"`
 }
 
 func Load(path string) (Config, error) {
@@ -61,6 +74,17 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.OIDC != nil && cfg.OIDC.RedirectURI != cfg.PublicURL+"/auth/oidc/callback" {
 		return errors.New("OIDC redirect URI must match public_url")
+	}
+	if cfg.OIDC == nil && cfg.SAML == nil && cfg.MTLS == nil {
+		return errors.New("at least one authentication method is required")
+	}
+	if cfg.SAML != nil && (cfg.SAML.Metadata == "" || cfg.SAML.EntityID == "") {
+		return errors.New("SAML metadata and entity ID required")
+	}
+	if cfg.MTLS != nil {
+		if _, port, err := net.SplitHostPort(cfg.MTLS.Listen); err != nil || port == "" || cfg.MTLS.Listen == cfg.Listen || cfg.MTLS.CA == "" || cfg.MTLS.Revocations == "" {
+			return errors.New("invalid mTLS listener configuration")
+		}
 	}
 	_, err = UpstreamURL(cfg.Upstream)
 	return err
