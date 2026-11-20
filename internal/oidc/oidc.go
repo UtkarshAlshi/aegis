@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"aegis/internal/audit"
@@ -40,14 +41,18 @@ type Discovery struct {
 
 type flow struct{ verifier, nonce string }
 type RP struct {
-	cfg       Config
-	discovery Discovery
-	pending   *session.Pending[flow]
-	sessions  *session.Store
-	client    *http.Client
-	cache     *jwtx.Cache
-	verify    *jwtx.Verifier
-	audit     *audit.Log
+	clock        clock.Clock
+	readiness    sync.Mutex
+	checkedUntil time.Time
+	checkErr     error
+	cfg          Config
+	discovery    Discovery
+	pending      *session.Pending[flow]
+	sessions     *session.Store
+	client       *http.Client
+	cache        *jwtx.Cache
+	verify       *jwtx.Verifier
+	audit        *audit.Log
 }
 
 func SecureURL(raw string) (*url.URL, error) {
@@ -68,38 +73,64 @@ func New(ctx context.Context, c clock.Clock, client *http.Client, cfg Config, s 
 		return nil, errors.New("invalid OIDC redirect URI")
 	}
 	client = jwtx.Client(client)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(cfg.Issuer, "/")+"/.well-known/openid-configuration", nil)
+	d, err := discover(ctx, client, cfg.Issuer)
 	if err != nil {
 		return nil, err
 	}
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, errors.New("OIDC discovery unavailable")
-	}
-	var d Discovery
-	if jwtx.ReadJSON(res, 64<<10, &d) != nil || d.Issuer != cfg.Issuer {
-		return nil, errors.New("OIDC discovery rejected")
-	}
-	for _, endpoint := range []string{d.Authorization, d.Token, d.JWKS} {
-		if _, err := SecureURL(endpoint); err != nil {
-			return nil, err
-		}
-	}
-	if len(d.Challenges) > 0 && !slices.Contains(d.Challenges, "S256") {
-		return nil, errors.New("issuer does not support S256")
-	}
+
 	if len(cfg.Algorithms) == 0 {
 		cfg.Algorithms = []jose.SignatureAlgorithm{jose.RS256}
 	}
-	cache := jwtx.NewCache(c, client, d.JWKS, 5*time.Minute)
+	cache := jwtx.NewCache(c, client, d.JWKS, 5*time.Minute, cfg.Algorithms...)
 	verifier, err := jwtx.NewVerifier(c, cfg.Issuer, cfg.ClientID, nil, cache.Lookup, cfg.Algorithms...)
 	if err != nil {
 		return nil, err
 	}
-	return &RP{cfg, d, session.NewPending[flow](c, pendingTTL), s, client, cache, verifier, a}, nil
+	return &RP{clock: c, cfg: cfg, discovery: d, pending: session.NewPending[flow](c, pendingTTL), sessions: s, client: client, cache: cache, verify: verifier, audit: a}, nil
 }
 
-func (p *RP) Ready(ctx context.Context) error { return p.cache.Warm(ctx) }
+func discover(ctx context.Context, client *http.Client, issuer string) (Discovery, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(issuer, "/")+"/.well-known/openid-configuration", nil)
+	if err != nil {
+		return Discovery{}, err
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return Discovery{}, errors.New("OIDC discovery unavailable")
+	}
+	var d Discovery
+	if jwtx.ReadJSON(res, 64<<10, &d) != nil || d.Issuer != issuer {
+		return Discovery{}, errors.New("OIDC discovery rejected")
+	}
+	for _, endpoint := range []string{d.Authorization, d.Token, d.JWKS} {
+		if _, err := SecureURL(endpoint); err != nil {
+			return Discovery{}, err
+		}
+	}
+	if len(d.Challenges) > 0 && !slices.Contains(d.Challenges, "S256") {
+		return Discovery{}, errors.New("issuer does not support S256")
+	}
+	return d, nil
+}
+
+// Ready memoizes bounded checks so probes do not amplify outbound traffic.
+func (p *RP) Ready(ctx context.Context) error {
+	p.readiness.Lock()
+	defer p.readiness.Unlock()
+	if p.clock.Now().Before(p.checkedUntil) {
+		return p.checkErr
+	}
+	d, err := discover(ctx, p.client, p.cfg.Issuer)
+	if err == nil && (d.JWKS != p.discovery.JWKS || d.Token != p.discovery.Token || d.Authorization != p.discovery.Authorization) {
+		err = errors.New("OIDC metadata endpoints changed")
+	}
+	if err == nil {
+		err = p.cache.Warm(ctx)
+	}
+	p.checkedUntil = p.clock.Now().Add(5 * time.Second)
+	p.checkErr = err
+	return err
+}
 
 func (p *RP) fail(w http.ResponseWriter, reason string, status int) {
 	p.audit.Event("oidc", reason, false)

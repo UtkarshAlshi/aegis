@@ -3,8 +3,10 @@ package jwtx
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -213,4 +215,99 @@ func FuzzCompactJWT(f *testing.F) {
 	f.Fuzz(func(t *testing.T, s string) {
 		_, _ = parse(s, []jose.SignatureAlgorithm{jose.ES256, jose.RS256, jose.EdDSA})
 	})
+}
+
+func TestJWKSCacheDirectivesAndReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		control string
+		age     string
+		ttl     time.Duration
+		stale   bool
+	}{
+		{"public, max-age=600", "10", 590 * time.Second, true},
+		{"max-age=99999", "", time.Hour, true},
+		{"max-age=10, must-revalidate", "", 10 * time.Second, false},
+		{"MAX-AGE=600, NO-STORE", "", 0, false},
+		{"no-cache", "", 0, false},
+		{"max-age=2", "10", 0, true},
+	} {
+		h := http.Header{}
+		h.Set("Cache-Control", tc.control)
+		h.Set("Age", tc.age)
+		p := readCachePolicy(h)
+		if p.ttl != tc.ttl || p.allowStale != tc.stale {
+			t.Errorf("%q: unexpected TTL or stale status %v", tc.control, p)
+		}
+	}
+	key := signKey(t)
+	var unavailable atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if unavailable.Load() {
+			w.WriteHeader(503)
+			return
+		}
+		w.Header().Set("Cache-Control", "max-age=1, must-revalidate")
+		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{key.Public}})
+	}))
+	defer srv.Close()
+	c := clock.NewManual(now)
+	ctx := context.Background()
+	mismatched := NewCache(c, nil, srv.URL, time.Minute, jose.RS256)
+	if mismatched.Warm(ctx) == nil {
+		t.Fatal("readiness accepted unusable signing algorithm")
+	}
+	cache := NewCache(c, nil, srv.URL, time.Minute, jose.ES256)
+	if err := cache.Warm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	unavailable.Store(true)
+	c.Advance(time.Second)
+	if cache.Warm(ctx) == nil {
+		t.Fatal("readiness accepted an expired key set")
+	}
+	if _, err := cache.Lookup(ctx, key.Public.KeyID, "ES256"); err == nil {
+		t.Fatal("must-revalidate returned stale key")
+	}
+}
+
+func TestAllowedAsymmetricJWTAlgorithms(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edPub, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		alg             jose.SignatureAlgorithm
+		private, public any
+	}{
+		{jose.RS256, rsaKey, &rsaKey.PublicKey},
+		{jose.EdDSA, edKey, edPub},
+	} {
+		t.Run(string(tc.alg), func(t *testing.T) {
+			s, err := jose.NewSigner(jose.SigningKey{Algorithm: tc.alg, Key: tc.private}, (&jose.SignerOptions{}).WithHeader("kid", "actual"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := jwt.Signed(s).Claims(testClaims()).Serialize()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lookup := func(_ context.Context, kid, alg string) (any, error) {
+				if kid != "actual" || alg != string(tc.alg) {
+					t.Error("incorrect protected key selection")
+				}
+				return tc.public, nil
+			}
+			v, err := NewVerifier(clock.NewManual(now), "issuer", "client", nil, lookup, jose.RS256, jose.EdDSA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = v.Verify(context.Background(), raw, "nonce"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }

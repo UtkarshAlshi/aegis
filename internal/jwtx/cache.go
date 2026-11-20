@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,15 +50,17 @@ type Cache struct {
 	client        *http.Client
 	url           string
 	maxStale      time.Duration
+	algorithms    []jose.SignatureAlgorithm
 	mu            sync.Mutex
 	keys          map[string]jose.JSONWebKey
 	expires, next time.Time
+	staleAllowed  bool
 	failure       error
 	flight        chan struct{}
 }
 
-func NewCache(c clock.Clock, client *http.Client, endpoint string, maxStale time.Duration) *Cache {
-	return &Cache{clock: c, client: Client(client), url: endpoint, maxStale: maxStale}
+func NewCache(c clock.Clock, client *http.Client, endpoint string, maxStale time.Duration, algs ...jose.SignatureAlgorithm) *Cache {
+	return &Cache{clock: c, client: Client(client), url: endpoint, maxStale: min(5*time.Minute, max(0, maxStale)), algorithms: slices.Clone(algs)}
 }
 
 func (c *Cache) Warm(ctx context.Context) error {
@@ -83,7 +86,7 @@ func (c *Cache) get(ctx context.Context, kid string, warm bool) (jose.JSONWebKey
 		now := c.clock.Now()
 		key, found := c.keys[kid]
 		fresh := c.keys != nil && now.Before(c.expires)
-		if fresh && (found || warm) && c.flight == nil {
+		if fresh && (found || (warm && len(c.keys) != 0)) && c.flight == nil {
 			c.mu.Unlock()
 			return key, nil
 		}
@@ -98,11 +101,12 @@ func (c *Cache) get(ctx context.Context, kid string, warm bool) (jose.JSONWebKey
 			refreshed = true
 			continue
 		}
-		if refreshed || now.Before(c.next) {
-			stale := found && c.failure != nil && now.Before(c.expires.Add(c.maxStale))
+		if refreshed || (now.Before(c.next) && (c.failure != nil || (!found && !warm))) {
+			stale := found && c.staleAllowed && c.failure != nil && now.Before(c.expires.Add(c.maxStale))
 			err := c.failure
+			usable := len(c.keys) != 0
 			c.mu.Unlock()
-			if found && (fresh || stale || (refreshed && err == nil)) || warm && refreshed && err == nil {
+			if found && (fresh || stale || (refreshed && err == nil)) || warm && refreshed && err == nil && usable {
 				return key, nil
 			}
 			if err != nil {
@@ -113,18 +117,15 @@ func (c *Cache) get(ctx context.Context, kid string, warm bool) (jose.JSONWebKey
 		c.flight = make(chan struct{})
 		c.mu.Unlock()
 
-		keys, ttl, err := c.fetch(ctx)
+		keys, policy, err := c.fetch(ctx)
 		c.mu.Lock()
 		now = c.clock.Now()
 		c.failure = err
 		c.next = now.Add(time.Second)
 		if err == nil {
 			c.keys = keys
-			c.expires = now.Add(ttl)
-			// An expired set may refresh immediately, even after an unknown-kid refresh.
-			if ttl > 0 && ttl < time.Second {
-				c.next = c.expires
-			}
+			c.expires = now.Add(policy.ttl)
+			c.staleAllowed = policy.allowStale
 		}
 		close(c.flight)
 		c.flight = nil
@@ -133,18 +134,18 @@ func (c *Cache) get(ctx context.Context, kid string, warm bool) (jose.JSONWebKey
 	}
 }
 
-func (c *Cache) fetch(ctx context.Context) (map[string]jose.JSONWebKey, time.Duration, error) {
+func (c *Cache) fetch(ctx context.Context) (map[string]jose.JSONWebKey, cachePolicy, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, cachePolicy{}, err
 	}
 	res, err := c.client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, cachePolicy{}, err
 	}
 	var set jose.JSONWebKeySet
 	if err = ReadJSON(res, 256<<10, &set); err != nil {
-		return nil, 0, err
+		return nil, cachePolicy{}, err
 	}
 	keys := make(map[string]jose.JSONWebKey)
 	seen := make(map[string]bool)
@@ -153,40 +154,63 @@ func (c *Cache) fetch(ctx context.Context) (map[string]jose.JSONWebKey, time.Dur
 			continue
 		}
 		if seen[key.KeyID] {
-			return nil, 0, errors.New("duplicate JWKS key ID")
+			return nil, cachePolicy{}, errors.New("duplicate JWKS key ID")
 		}
 		seen[key.KeyID] = true
 		if !key.IsPublic() || !key.Valid() || (key.Use != "" && key.Use != "sig") {
 			continue
 		}
-		if !matches(key.Key, "RS256") && !matches(key.Key, "ES256") && !matches(key.Key, "EdDSA") {
+		supported := c.algorithms
+		if len(supported) == 0 {
+			supported = []jose.SignatureAlgorithm{jose.RS256, jose.ES256, jose.EdDSA}
+		}
+		if !slices.ContainsFunc(supported, func(alg jose.SignatureAlgorithm) bool {
+			return (key.Algorithm == "" || key.Algorithm == string(alg)) && matches(key.Key, string(alg))
+		}) {
 			continue
 		}
 		keys[key.KeyID] = key
 	}
-	return keys, cacheTTL(res.Header), nil
+	return keys, readCachePolicy(res.Header), nil
 }
 
-func cacheTTL(h http.Header) time.Duration {
-	ttl := int64(300)
+type cachePolicy struct {
+	ttl        time.Duration
+	allowStale bool
+}
+
+func readCachePolicy(h http.Header) cachePolicy {
+	const defaultTTL = 300
+	const maxTTL = 3600
+	ttl := int64(defaultTTL)
+	var hasTTL, immediate bool
+	allowStale := true
 	for _, value := range h.Values("Cache-Control") {
 		for _, directive := range strings.Split(value, ",") {
 			name, arg, _ := strings.Cut(strings.TrimSpace(directive), "=")
-			switch strings.ToLower(name) {
-			case "no-cache", "no-store", "must-revalidate":
-				if name != "must-revalidate" {
-					return 0
-				}
+			switch strings.ToLower(strings.TrimSpace(name)) {
+			case "no-cache", "no-store":
+				allowStale = false
+				immediate = true
+			case "must-revalidate":
+				allowStale = false
 			case "max-age":
-				n, err := strconv.ParseInt(strings.Trim(arg, "\""), 10, 64)
+				n, err := strconv.ParseInt(strings.Trim(strings.TrimSpace(arg), "\""), 10, 64)
 				if err == nil && n >= 0 {
+					if !hasTTL {
+						ttl = maxTTL
+					}
+					hasTTL = true
 					ttl = min(ttl, n)
 				}
 			}
 		}
 	}
+	if immediate {
+		ttl = 0
+	}
 	if age, err := strconv.ParseInt(h.Get("Age"), 10, 64); err == nil && age > 0 {
 		ttl = max(0, ttl-age)
 	}
-	return time.Duration(ttl) * time.Second
+	return cachePolicy{time.Duration(ttl) * time.Second, allowStale}
 }

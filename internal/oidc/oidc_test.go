@@ -120,3 +120,30 @@ func TestOIDCDiscoveryIssuerAndRedirect(t *testing.T) {
 		t.Fatal("discovery issuer mismatch accepted")
 	}
 }
+
+func TestOIDCReadinessRejectsUnavailableOrDriftedProvider(t *testing.T) {
+	ctx := context.Background()
+	c := clock.NewManual(time.Unix(100000, 0))
+	idp, err := testidp.NewOIDC(c, "client", "https://gateway.example/auth/oidc/callback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idp.Server.Close()
+	p, err := oidc.New(ctx, c, idp.Server.Client(), idp.Config(), session.New(c, time.Minute, time.Hour), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = p.Ready(ctx); err != nil {
+		t.Fatal(err)
+	}
+	idp.SetMode(testidp.OIDCWrongIssuer)
+	c.Advance(5 * time.Second)
+	if p.Ready(ctx) == nil {
+		t.Fatal("readiness accepted discovery with changed issuer")
+	}
+	idp.SetMode(testidp.OIDCJWKSUnavailable)
+	c.Advance(time.Minute)
+	if p.Ready(ctx) == nil {
+		t.Fatal("readiness accepted expired JWKS during outage")
+	}
+}

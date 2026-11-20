@@ -8,7 +8,9 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,7 +30,7 @@ import (
 )
 
 func signerFromFile(path string) (*jwtx.Signer, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := pki.ReadFile(path, 256<<10)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +49,7 @@ func signerFromFile(path string) (*jwtx.Signer, error) {
 	return jwtx.NewSigner(ec)
 }
 
-func run(path string) error {
+func run(ctx context.Context, path string) error {
 	cfg, err := config.Load(path)
 	if err != nil {
 		return err
@@ -73,7 +75,7 @@ func run(path string) error {
 	}
 	var rp *oidc.RP
 	if cfg.OIDC != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		defer cancel()
 		rp, err = oidc.New(ctx, c, nil, *cfg.OIDC, s, a)
 		if err != nil {
@@ -110,7 +112,23 @@ func run(path string) error {
 		srv.ErrorLog = slog.NewLogLogger(slog.NewTextHandler(io.Discard, nil), slog.LevelDebug)
 		return srv
 	}
-	browser := makeServer(cfg.Listen, mux)
+	var ready func(context.Context) error
+	if rp != nil {
+		ready = rp.Ready
+	}
+	if saml != nil {
+		oidcReady := ready
+		ready = func(ctx context.Context) error {
+			if err := saml.Ready(); err != nil {
+				return err
+			}
+			if oidcReady != nil {
+				return oidcReady(ctx)
+			}
+			return nil
+		}
+	}
+	browser := makeServer(cfg.Listen, g.BrowserHandler(mux, ready))
 	servers := []*http.Server{browser}
 	if cfg.MTLS != nil {
 		raw, err := pki.ReadFile(cfg.MTLS.CA, 256<<10)
@@ -125,6 +143,7 @@ func run(path string) error {
 		machine.Machine = clients.Authenticate
 		srv := makeServer(cfg.MTLS.Listen, &machine)
 		clients.Configure(srv.TLSConfig)
+		srv.ErrorLog = log.New(audit.TLSLog{Audit: a}, "", 0)
 		servers = append(servers, srv)
 	}
 
@@ -154,19 +173,40 @@ func run(path string) error {
 			}
 		}
 	}()
-	failed := make(chan error, len(servers))
+	listeners := make([]net.Listener, 0, len(servers))
 	for _, srv := range servers {
-		defer srv.Close()
-		go func() { failed <- srv.ListenAndServeTLS("", "") }()
+		l, err := net.Listen("tcp", srv.Addr)
+		if err != nil {
+			return err
+		}
+		defer l.Close()
+		listeners = append(listeners, l)
 	}
-	return <-failed
+	failed := make(chan error, len(servers))
+	for i, srv := range servers {
+		defer srv.Close()
+		go func() { failed <- srv.ServeTLS(listeners[i], "", "") }()
+	}
+	var serveErr error
+	select {
+	case <-ctx.Done():
+	case serveErr = <-failed:
+	}
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, srv := range servers {
+		serveErr = errors.Join(serveErr, srv.Shutdown(shutdown))
+	}
+	return serveErr
 
 }
 
 func main() {
 	path := flag.String("config", "aegis.yaml", "gateway configuration file")
 	flag.Parse()
-	if err := run(*path); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, *path); err != nil {
 		slog.Error("gateway stopped", "error", err)
 		os.Exit(1)
 	}

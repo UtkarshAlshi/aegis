@@ -34,6 +34,7 @@ const (
 	OIDCWrongVerifier
 	OIDCError
 	OIDCTimeout
+	OIDCJWKSUnavailable
 )
 
 type code struct {
@@ -96,6 +97,10 @@ func (p *OIDC) discovery(w http.ResponseWriter, _ *http.Request) {
 	respond(w, oidc.Discovery{Issuer: issuer, Authorization: p.Server.URL + "/authorize", Token: p.Server.URL + "/token", JWKS: p.Server.URL + "/keys", Challenges: []string{"S256"}})
 }
 func (p *OIDC) keys(w http.ResponseWriter, _ *http.Request) {
+	if p.Mode() == OIDCJWKSUnavailable {
+		http.Error(w, "unavailable", 503)
+		return
+	}
 	w.Header().Set("Cache-Control", "max-age=60")
 	respond(w, jose.JSONWebKeySet{Keys: []jose.JSONWebKey{p.signer.Public}})
 }
@@ -132,7 +137,11 @@ func (p *OIDC) authorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", 503)
 		return
 	}
-	p.codes[key] = code{q.Get("code_challenge"), q.Get("nonce"), now.Add(time.Minute)}
+	expected := q.Get("code_challenge")
+	if p.mode == OIDCWrongVerifier {
+		expected = base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	}
+	p.codes[key] = code{expected, q.Get("nonce"), now.Add(time.Minute)}
 	p.mu.Unlock()
 	u, _ := url.Parse(p.RedirectURI)
 	args := url.Values{"state": {q.Get("state")}, "code": {key}}
@@ -174,7 +183,7 @@ func (p *OIDC) token(w http.ResponseWriter, r *http.Request) {
 	record, err := p.consume(r)
 	secret := r.PostForm.Get("code_verifier")
 	sum := sha256.Sum256([]byte(secret))
-	if err != nil || len(secret) < 43 || len(secret) > 128 || base64.RawURLEncoding.EncodeToString(sum[:]) != record.challenge || mode == OIDCWrongVerifier {
+	if err != nil || len(secret) < 43 || len(secret) > 128 || base64.RawURLEncoding.EncodeToString(sum[:]) != record.challenge {
 		http.Error(w, "invalid grant", 400)
 		return
 	}

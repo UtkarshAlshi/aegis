@@ -48,6 +48,7 @@ func New(g Gateway, upstream *url.URL) (*Gateway, error) {
 	if upstream == nil || g.Clock == nil || g.Sessions == nil || g.Policy == nil || g.Signer == nil || g.Issuer == "" || g.Audience == "" {
 		return nil, errors.New("incomplete gateway configuration")
 	}
+	origin, _ := url.Parse(g.Issuer)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	transport.ResponseHeaderTimeout = 5 * time.Second
@@ -60,6 +61,10 @@ func New(g Gateway, upstream *url.URL) (*Gateway, error) {
 			cleanRequestHeaders(p.Out.Header)
 			p.SetURL(upstream)
 			p.SetXForwarded()
+			p.Out.Header.Del("X-Forwarded-Host")
+			if origin != nil && origin.Host != "" {
+				p.Out.Header.Set("X-Forwarded-Host", origin.Host)
+			}
 			if data.forwardedFor != "" {
 				p.Out.Header.Set("X-Forwarded-For", data.forwardedFor)
 			}
@@ -130,6 +135,9 @@ func (g *Gateway) forwardedFor(r *http.Request) string {
 }
 
 func validHeaders(r *http.Request) bool {
+	if strings.ContainsAny(r.Host, "\r\n") {
+		return false
+	}
 	cl, te := r.Header.Values("Content-Length"), r.Header.Values("Transfer-Encoding")
 	if len(cl) > 1 || (len(cl) > 0 && strings.Contains(cl[0], ",")) || len(r.TransferEncoding) > 0 || len(te) > 0 {
 		return false
@@ -201,7 +209,11 @@ func (g *Gateway) Identity(r *http.Request) (session.Identity, string, error) {
 		g.Audit.Event("mtls", "certificate_verified", true)
 		return id, "", nil
 	}
-	return g.Sessions.Authenticate(r)
+	id, csrf, err := g.Sessions.Authenticate(r)
+	if err == nil {
+		g.Audit.Event("session", "session_verified", true)
+	}
+	return id, csrf, err
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -212,7 +224,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		g.Audit.Event("session", "authentication_required", false)
+		if g.Machine == nil {
+			g.Audit.Event("session", "authentication_required", false)
+		}
 		http.Error(w, "authentication required", 401)
 		return
 	}
@@ -237,6 +251,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (g *Gateway) JWKS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/jwk-set+json")
+	w.Header().Set("Cache-Control", "public, max-age=60, must-revalidate")
 	_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{g.Signer.Public}})
 }
 

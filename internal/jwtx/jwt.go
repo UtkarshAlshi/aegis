@@ -137,7 +137,14 @@ func NewSigner(key *ecdsa.PrivateKey) (*Signer, error) {
 }
 
 func (s *Signer) Sign(c Claims) (string, error) {
-	return jwt.Signed(s.signer).Claims(c).Serialize()
+	raw, err := jwt.Signed(s.signer).Claims(c).Serialize()
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > MaxToken {
+		return "", errors.New("signed token exceeds size limit")
+	}
+	return raw, nil
 }
 
 func (s *Signer) Lookup(_ context.Context, kid, alg string) (any, error) {

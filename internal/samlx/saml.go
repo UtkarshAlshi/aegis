@@ -2,6 +2,9 @@ package samlx
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
@@ -32,6 +35,7 @@ const bearer = "urn:oasis:names:tc:SAML:2.0:cm:bearer"
 type login struct{ requestID, oldSession string }
 
 type SP struct {
+	idpKeys  []*x509.Certificate
 	clock    clock.Clock
 	sp       saml.ServiceProvider
 	endpoint string
@@ -54,12 +58,23 @@ func New(c clock.Clock, origin, entityID string, metadata []byte, s *session.Sto
 	if err != nil || idp.EntityID != entityID || len(idp.IDPSSODescriptors) != 1 || (!idp.ValidUntil.IsZero() && !c.Now().Before(idp.ValidUntil)) {
 		return nil, errors.New("IdP metadata rejected")
 	}
-	var signingKeys int
+	var signingKeys []*x509.Certificate
 	var redirect string
 	for _, d := range idp.IDPSSODescriptors {
 		for _, key := range d.KeyDescriptors {
 			if key.Use == "" || key.Use == "signing" {
-				signingKeys += len(key.KeyInfo.X509Data.X509Certificates)
+				for _, encoded := range key.KeyInfo.X509Data.X509Certificates {
+					// Metadata certificates may be line-wrapped.
+					der, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(encoded.Data), ""))
+					if err != nil {
+						return nil, errors.New("invalid SAML signing certificate")
+					}
+					cert, err := x509.ParseCertificate(der)
+					if err != nil || !strongSigningKey(cert.PublicKey) {
+						return nil, errors.New("unsupported SAML signing certificate")
+					}
+					signingKeys = append(signingKeys, cert)
+				}
 			}
 		}
 		for _, binding := range d.SingleSignOnServices {
@@ -71,14 +86,42 @@ func New(c clock.Clock, origin, entityID string, metadata []byte, s *session.Sto
 			}
 		}
 	}
-	if _, err = oidc.SecureURL(redirect); err != nil || signingKeys == 0 {
+	if _, err = oidc.SecureURL(redirect); err != nil || len(signingKeys) == 0 {
 		return nil, errors.New("IdP signing keys and HTTPS SSO are required")
 	}
 	metadataURL, acsURL := *base, *base
 	metadataURL.Path = "/auth/saml/metadata"
 	acsURL.Path = "/auth/saml/acs"
-	sp := saml.ServiceProvider{EntityID: metadataURL.String(), MetadataURL: metadataURL, AcsURL: acsURL, IDPMetadata: idp, RejectUnknownConditions: true}
-	return &SP{clock: c, sp: sp, endpoint: redirect, pending: session.NewPending[login](c, ttl), sessions: s, audit: a, used: make(map[string]time.Time)}, nil
+	sp := saml.ServiceProvider{EntityID: metadataURL.String(), MetadataURL: metadataURL, AcsURL: acsURL, IDPMetadata: idp, RejectUnknownConditions: true, RejectSHA1Signatures: true}
+	provider := &SP{idpKeys: signingKeys, clock: c, sp: sp, endpoint: redirect, pending: session.NewPending[login](c, ttl), sessions: s, audit: a, used: make(map[string]time.Time)}
+	if err := provider.Ready(); err != nil {
+		return nil, err
+	}
+	return provider, nil
+}
+
+func strongSigningKey(key any) bool {
+	switch k := key.(type) {
+	case *ecdsa.PublicKey:
+		return k.Params().BitSize >= 256
+	case *rsa.PublicKey:
+		return k.N.BitLen() >= 2048
+	default:
+		return false
+	}
+}
+
+func (s *SP) Ready() error {
+	now := s.clock.Now()
+	if until := s.sp.IDPMetadata.ValidUntil; !until.IsZero() && !now.Before(until) {
+		return errors.New("SAML metadata expired")
+	}
+	for _, key := range s.idpKeys {
+		if !now.Before(key.NotBefore) && now.Before(key.NotAfter) {
+			return nil
+		}
+	}
+	return errors.New("SAML signing certificate unavailable")
 }
 
 func (s *SP) Register(mux *http.ServeMux) {
@@ -165,6 +208,9 @@ func (s *SP) ACS(w http.ResponseWriter, r *http.Request) {
 
 func (s *SP) validate(raw []byte, requestID string) (session.Identity, error) {
 	var id session.Identity
+	if err := s.Ready(); err != nil {
+		return id, err
+	}
 	envelope, err := inspect(raw)
 	if err != nil {
 		return id, err
@@ -255,6 +301,7 @@ func xmlEnvelope(raw []byte, visit func(xml.StartElement, []xml.Name) error) err
 	dec := xml.NewDecoder(bytes.NewReader(raw))
 	var stack []xml.Name
 	count := 0
+	sawDeclaration := false
 	for {
 		token, err := dec.Token()
 		if err == io.EOF {
@@ -267,9 +314,10 @@ func xmlEnvelope(raw []byte, visit func(xml.StartElement, []xml.Name) error) err
 		case xml.Directive:
 			return errors.New("XML directive prohibited")
 		case xml.ProcInst:
-			if t.Target != "xml" || count != 0 {
+			if sawDeclaration || t.Target != "xml" || count != 0 {
 				return errors.New("processing instruction prohibited")
 			}
+			sawDeclaration = true
 		case xml.StartElement:
 			if len(stack) == 0 {
 				count++

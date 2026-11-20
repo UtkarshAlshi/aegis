@@ -48,7 +48,11 @@ func listener(port int) (net.Listener, error) {
 	return net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 }
 
-func run(ctx context.Context, browserPort, machinePort int) error {
+type endpoints struct {
+	browser, machine, oidc, saml, dir string
+}
+
+func run(ctx context.Context, browserPort, machinePort int, announce func(endpoints)) error {
 	browserListener, err := listener(browserPort)
 	if err != nil {
 		return err
@@ -149,7 +153,7 @@ func run(ctx context.Context, browserPort, machinePort int) error {
 	if err != nil {
 		return err
 	}
-	cache := jwtx.NewCache(c, client, origin+"/.well-known/jwks.json", 0)
+	cache := jwtx.NewCache(c, client, origin+"/.well-known/jwks.json", 0, jose.ES256)
 	zero := time.Duration(0)
 	verify, err := jwtx.NewVerifier(c, origin, audience, &zero, cache.Lookup, jose.ES256)
 	if err != nil {
@@ -180,7 +184,13 @@ func run(ctx context.Context, browserPort, machinePort int) error {
 	}
 	routes := shared.BrowserRoutes(rp, true)
 	sp.Register(routes)
-	browser := proxy.Server(browserListener.Addr().String(), routes)
+	ready := func(ctx context.Context) error {
+		if err := sp.Ready(); err != nil {
+			return err
+		}
+		return rp.Ready(ctx)
+	}
+	browser := proxy.Server(browserListener.Addr().String(), shared.BrowserHandler(routes, ready))
 	browser.TLSConfig = certConfig()
 	browser.ErrorLog = log.New(io.Discard, "", 0)
 	machineGateway := *shared
@@ -191,18 +201,13 @@ func run(ctx context.Context, browserPort, machinePort int) error {
 	machineGateway.Machine = clients.Authenticate
 	machine := proxy.Server(machineListener.Addr().String(), &machineGateway)
 	machine.TLSConfig = certConfig()
-	machine.ErrorLog = log.New(io.Discard, "", 0)
+	machine.ErrorLog = log.New(audit.TLSLog{Audit: a}, "", 0)
 	clients.Configure(machine.TLSConfig)
 	stopped := make(chan error, 2)
 	go func() { stopped <- browser.ServeTLS(browserListener, "", "") }()
 	go func() { stopped <- machine.ServeTLS(machineListener, "", "") }()
 
-	fmt.Printf("Browser (OIDC alice, SAML bob)  %s/\n", origin)
-	fmt.Printf("Mock OIDC                      %s\n", oidp.Server.URL)
-	fmt.Printf("Mock SAML metadata             %s\n", sidp.EntityID())
-	fmt.Printf("Demo CA for browser trust      %s\n", filepath.Join(dir, "ca.crt"))
-	fmt.Printf("Machine (robot)                %s\n", machineURL)
-	fmt.Printf("curl --cacert %q --cert %q --key %q %q\n", filepath.Join(dir, "ca.crt"), filepath.Join(dir, "robot.crt"), filepath.Join(dir, "robot.key"), machineURL)
+	announce(endpoints{origin, machineURL, oidp.Server.URL, sidp.EntityID(), dir})
 
 	var serveErr error
 	select {
@@ -214,13 +219,23 @@ func run(ctx context.Context, browserPort, machinePort int) error {
 	return errors.Join(serveErr, browser.Shutdown(shutdown), machine.Shutdown(shutdown))
 }
 
+func printEndpoints(e endpoints) {
+	fmt.Printf("Browser (OIDC alice, SAML bob)  %s/\n", e.browser)
+	fmt.Printf("Mock OIDC                      %s\n", e.oidc)
+	fmt.Printf("Mock SAML metadata             %s\n", e.saml)
+	fmt.Printf("Demo CA for browser trust      %s\n", filepath.Join(e.dir, "ca.crt"))
+	fmt.Printf("Machine (robot)                %s\n", e.machine)
+	fmt.Printf("curl --cacert %q --cert %q --key %q %q\n", filepath.Join(e.dir, "ca.crt"), filepath.Join(e.dir, "robot.crt"), filepath.Join(e.dir, "robot.key"), e.machine)
+
+}
+
 func main() {
 	browser := flag.Int("browser-port", 8443, "browser HTTPS port (0 chooses a port)")
 	machine := flag.Int("machine-port", 8444, "mTLS port (0 chooses a port)")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, *browser, *machine); err != nil {
+	if err := run(ctx, *browser, *machine, printEndpoints); err != nil {
 		slog.Error("demo stopped", "error", err)
 		os.Exit(1)
 	}
