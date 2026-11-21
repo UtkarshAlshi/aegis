@@ -311,3 +311,41 @@ func TestAllowedAsymmetricJWTAlgorithms(t *testing.T) {
 		})
 	}
 }
+
+func TestFreshJWKSKeyAvailableDuringRefresh(t *testing.T) {
+	key := signKey(t)
+	var hits atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 2 {
+			close(started)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		w.Header().Set("Cache-Control", "max-age=60")
+		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{key.Public}})
+	}))
+	defer srv.Close()
+	defer close(release)
+	c := clock.NewManual(now)
+	cache := NewCache(c, nil, srv.URL, 0, jose.ES256)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := cache.Warm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.Advance(time.Second)
+	go func() { _, _ = cache.Lookup(ctx, "other-key", "ES256") }()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("JWKS refresh never started")
+	}
+	if _, err := cache.Lookup(ctx, key.Public.KeyID, "ES256"); err != nil {
+		t.Fatalf("fresh key blocked by unrelated refresh: %v", err)
+	}
+}

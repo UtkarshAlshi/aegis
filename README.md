@@ -6,16 +6,21 @@ Aegis is a Go identity gateway that authenticates browser users with OIDC or SAM
 
 Use Go 1.25 or later and Make. Choose a supported, patched Go release. The race suite also needs a working C toolchain. Docker and external identity-provider accounts are unnecessary.
 
+On macOS, install Go with `brew install go` or use the [official installer](https://go.dev/dl/). Open a new terminal after using the installer. Run the following from the checkout containing `go.mod`.
+
 ```sh
+go version
 make demo
 ```
+
+If you downloaded the project bundle, extract the ZIP once and clone `aegis.bundle` from the extracted directory. After you enter the cloned checkout, start with `go version` and `make demo`.
 
 1. Import the printed demo CA certificate into a disposable browser profile's trusted authorities. Open **https://localhost:8443/** in that profile.
 2. Choose **Sign in with OIDC**, then **Continue as alice**. Select **Open protected route** and check that the upstream reports `alice` with provider `oidc`.
 3. Sign out and choose **Sign in with SAML**. Continue as **bob**, select **Return to Aegis**, and open the protected route again. The upstream should report `bob` with provider `saml`.
 4. Run the `curl --cacert … --cert … --key …` command printed by the demo. It calls the mTLS listener at **https://localhost:8444/protected** and should return `spiffe://aegis/service/robot`.
 
-The demo creates fresh certificates and keys on each run and removes its temporary copy when it shuts down. Discard the temporary browser profile after testing. If a port is busy, run `go run ./cmd/demo -browser-port 0 -machine-port 0` and use the printed URLs.
+The demo creates fresh certificates and keys on each run and removes its temporary copy when it shuts down. Discard the temporary browser profile after testing. If a port is busy, run `make demo DEMO_ARGS="-browser-port 0 -machine-port 0"` and use the printed URLs.
 
 ```sh
 go vet ./...

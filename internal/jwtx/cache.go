@@ -86,7 +86,8 @@ func (c *Cache) get(ctx context.Context, kid string, warm bool) (jose.JSONWebKey
 		now := c.clock.Now()
 		key, found := c.keys[kid]
 		fresh := c.keys != nil && now.Before(c.expires)
-		if fresh && (found || (warm && len(c.keys) != 0)) && c.flight == nil {
+		// A refresh for an unfamiliar key must not stall requests using fresh keys.
+		if fresh && (found || (warm && len(c.keys) != 0)) {
 			c.mu.Unlock()
 			return key, nil
 		}

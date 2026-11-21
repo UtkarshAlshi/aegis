@@ -55,12 +55,12 @@ type endpoints struct {
 func run(ctx context.Context, browserPort, machinePort int, announce func(endpoints)) error {
 	browserListener, err := listener(browserPort)
 	if err != nil {
-		return err
+		return fmt.Errorf("bind browser HTTPS listener (-browser-port %d): %w", browserPort, err)
 	}
 	defer browserListener.Close()
 	machineListener, err := listener(machinePort)
 	if err != nil {
-		return err
+		return fmt.Errorf("bind mTLS listener (-machine-port %d): %w", machinePort, err)
 	}
 	defer machineListener.Close()
 	origin := fmt.Sprintf("https://localhost:%d", browserListener.Addr().(*net.TCPAddr).Port)

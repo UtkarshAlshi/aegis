@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -160,4 +161,27 @@ func send(t *testing.T, c *http.Client, r *http.Request) (int, string, *url.URL)
 		t.Fatal(err)
 	}
 	return res.StatusCode, string(raw), res.Request.URL
+}
+
+func TestDemoReportsWhichPortIsBusy(t *testing.T) {
+	occupied, err := listener(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	port := occupied.Addr().(*net.TCPAddr).Port
+	for _, tc := range []struct {
+		browser, machine int
+		flag             string
+	}{
+		{browser: port, flag: "-browser-port"},
+		{machine: port, flag: "-machine-port"},
+	} {
+		err := run(context.Background(), tc.browser, tc.machine, func(endpoints) {
+			t.Fatal("demo announced startup with an occupied port")
+		})
+		if err == nil || !strings.Contains(err.Error(), tc.flag) {
+			t.Errorf("expected error identifying %s, got %v", tc.flag, err)
+		}
+	}
 }
